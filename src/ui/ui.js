@@ -4,9 +4,10 @@
 
 import { FORMATS } from '../model/formats.js';
 import { assetsByType, loadAssetImage, getAsset, getLoadedImage, preloadDeckAssets, registerCustomAsset } from '../model/assets.js';
-import { generateDeck, MODELS, DEFAULT_MODEL } from '../ai/generate.js';
+import { generateDeck, PROVIDERS, DEFAULT_PROVIDER } from '../ai/generate.js';
 import { TEXT_COLORS, DEFAULT_TEXT_COLOR } from '../model/brand.js';
 import { EXAMPLE_DECK } from '../model/example-deck.js';
+import { listProjects, getProject, saveProject, deleteProject, newId, setActiveId, getActiveId } from '../core/projects.js';
 import { removeBackground } from '../render/bg-remove.js';
 import { OffscreenRenderer } from '../export/offscreen.js';
 import { exportCurrentPNG, exportAllPNG } from '../export/png.js';
@@ -102,6 +103,7 @@ export class UI {
       else if (k === 'png-all') this._run('PNG-Set', (p) => exportAllPNG(this.store, p));
       else if (k === 'pdf') this._run('PDF', (p) => exportPDF(this.store, p));
       else if (k === 'mp4') this._run('Video', (p) => exportMP4(this.store, { onProgress: p }));
+      else if (k === 'deck-zip') this._exportDeckZip();
     });
   }
   _syncToolbar() {
@@ -419,14 +421,124 @@ export class UI {
     this._toast('Grafiken zurückgesetzt (Cmd+Z macht es rückgängig)', 'success');
   }
   _resetKey() {
-    sessionStorage.removeItem('cpe.aiKey');
-    sessionStorage.removeItem('cpe.aiModel');
+    // alle anbieter-spezifischen Keys/Modelle entfernen (cpe.aiKey.*, cpe.aiModel.*)
+    Object.keys(sessionStorage).filter((k) => /^cpe\.ai(Key|Model|Provider)/.test(k))
+      .forEach((k) => sessionStorage.removeItem(k));
     this._toast('API-Key entfernt', 'success');
   }
   _resetAll() {
     if (!confirm('Wirklich ALLES zurücksetzen? Inhalte, Grafiken, hochgeladene Bilder und der API-Key gehen verloren.')) return;
     try { localStorage.clear(); sessionStorage.clear(); } catch {}
     location.reload();
+  }
+
+  // ---- Projekte (lokal, IndexedDB) ------------------------------------
+  initProjects(proj) {
+    this._activeId = proj?.activeId || getActiveId();
+    this._activeName = proj?.name || 'Projekt';
+    this._updateProjBtn();
+    this._bindProjectsMenu();
+    // Auto-Speichern bei jeder Deck-/Format-Änderung (gebündelt).
+    let t;
+    const schedule = () => { clearTimeout(t); t = setTimeout(() => this._saveActiveProject(), 700); };
+    this.store.on('deck', schedule);
+    this.store.on('format', schedule);
+  }
+  _updateProjBtn() {
+    const btn = document.getElementById('projBtn');
+    if (btn) { btn.textContent = (this._activeName || 'Projekte') + ' ▾'; btn.title = `Projekt: ${this._activeName || '–'} (lokal gespeichert)`; }
+  }
+  _bindProjectsMenu() {
+    const btn = document.getElementById('projBtn'), menu = document.getElementById('projMenu');
+    if (!btn || !menu) return;
+    btn.onclick = async (e) => {
+      e.stopPropagation();
+      const open = menu.classList.contains('open');
+      if (open) { menu.classList.remove('open'); return; }
+      await this._renderProjMenu(); menu.classList.add('open');
+    };
+    document.addEventListener('click', () => menu.classList.remove('open'));
+    menu.addEventListener('click', async (e) => {
+      const el = e.target.closest('[data-proj-new],[data-proj-open],[data-proj-rename],[data-proj-del]');
+      if (!el) return;
+      e.stopPropagation();
+      if (el.hasAttribute('data-proj-new')) { menu.classList.remove('open'); await this._newProject(); }
+      else if (el.dataset.projOpen) { menu.classList.remove('open'); await this._openProject(el.dataset.projOpen); }
+      else if (el.dataset.projRename) { await this._renameProject(el.dataset.projRename); await this._renderProjMenu(); }
+      else if (el.dataset.projDel) { await this._deleteProject(el.dataset.projDel); await this._renderProjMenu(); }
+    });
+  }
+  async _renderProjMenu() {
+    const menu = document.getElementById('projMenu');
+    const all = await listProjects();
+    const esc = (s) => (s || '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+    let html = '<button class="proj-new" data-proj-new>＋ Neues Projekt</button><div class="menu-sep"></div>';
+    html += all.length
+      ? all.map((p) => `<div class="proj-row ${p.id === this._activeId ? 'active' : ''}">`
+          + `<button class="proj-open" data-proj-open="${p.id}" title="${esc(p.name)}">${esc(p.name)}</button>`
+          + `<button class="proj-rename" data-proj-rename="${p.id}" title="Umbenennen">✎</button>`
+          + `<button class="proj-del" data-proj-del="${p.id}" title="Löschen">×</button></div>`).join('')
+      : '<div class="proj-empty">Noch keine Projekte.</div>';
+    menu.innerHTML = html;
+  }
+  async _applyDeckObject(deck) {
+    this.store.loadDeck(deck);
+    await preloadDeckAssets(this.store.deck);
+    this.renderer.fit();
+    this.renderThumbs();
+  }
+  async _saveActiveProject() {
+    if (!this._activeId) return;
+    try { await saveProject({ id: this._activeId, name: this._activeName || 'Projekt', deck: JSON.parse(this.store.exportJSON()) }); }
+    catch (e) { console.warn('[Projekt] Speichern fehlgeschlagen:', e); }
+  }
+  async _newProject() {
+    await this._saveActiveProject();                       // aktuelles sichern
+    const def = 'Posting ' + new Date().toLocaleDateString('de-DE');
+    const name = (prompt('Name des neuen Projekts:', def) || '').trim();
+    if (!name) return;
+    this._activeId = newId(); this._activeName = name; setActiveId(this._activeId);
+    this.store.loadDeck(JSON.parse(JSON.stringify(EXAMPLE_DECK)));   // frisches Start-Deck (Blindtext)
+    this._assignFolderBackgrounds();
+    await preloadDeckAssets(this.store.deck);
+    this.renderer.fit(); this.renderThumbs();
+    await this._saveActiveProject();
+    this._updateProjBtn();
+    this._toast(`Projekt „${name}" angelegt`, 'success');
+  }
+  async _openProject(id) {
+    if (id === this._activeId) return;
+    await this._saveActiveProject();                       // aktuelles sichern
+    const p = await getProject(id);
+    if (!p) { this._toast('Projekt nicht gefunden', 'error'); return; }
+    this._activeId = id; this._activeName = p.name; setActiveId(id);
+    await this._applyDeckObject(p.deck);
+    this._updateProjBtn();
+    this._toast(`„${p.name}" geöffnet`, 'success');
+  }
+  async _renameProject(id) {
+    const p = await getProject(id); if (!p) return;
+    const name = (prompt('Projekt umbenennen:', p.name) || '').trim();
+    if (!name || name === p.name) return;
+    p.name = name; await saveProject(p);
+    if (id === this._activeId) { this._activeName = name; this._updateProjBtn(); }
+  }
+  async _deleteProject(id) {
+    const p = await getProject(id); if (!p) return;
+    if (!confirm(`Projekt „${p.name}" wirklich löschen?`)) return;
+    await deleteProject(id);
+    if (id === this._activeId) {
+      this._activeId = null;                               // nicht mehr aktiv -> kein Re-Save
+      const rest = await listProjects();
+      if (rest.length) { await this._openProject(rest[0].id); }
+      else {
+        this._activeId = newId(); this._activeName = 'Projekt 1'; setActiveId(this._activeId);
+        this.store.loadDeck(JSON.parse(JSON.stringify(EXAMPLE_DECK))); this._assignFolderBackgrounds();
+        await preloadDeckAssets(this.store.deck); this.renderer.fit(); this.renderThumbs();
+        await this._saveActiveProject(); this._updateProjBtn();
+      }
+    }
+    this._toast('Projekt gelöscht', 'success');
   }
 
   // ---- KI: Folien mit Claude erzeugen (eigener Key, direkt im Browser) --
@@ -436,16 +548,53 @@ export class UI {
     if (!btn || !modal) return;
     const $ = (id) => document.getElementById(id);
 
-    // Modell-Auswahl füllen
-    const sel = $('genModel');
-    sel.innerHTML = MODELS.map((m) => `<option value="${m.id}">${m.label}</option>`).join('');
-    sel.value = sessionStorage.getItem('cpe.aiModel') || DEFAULT_MODEL;
-
-    // Erklärung nur zeigen, solange kein Key drin ist; Key sofort in der Sitzung merken.
+    const provSel = $('genProvider'), sel = $('genModel');
     const keyEl = $('genKey'), helpBox = $('genKeyHelpBox');
-    const syncHelp = () => { helpBox.hidden = keyEl.value.trim().length > 0; };
-    keyEl.addEventListener('input', syncHelp);
-    keyEl.addEventListener('change', () => { const v = keyEl.value.trim(); if (v) sessionStorage.setItem('cpe.aiKey', v); });
+
+    // Anbieter-spezifische Hilfe (wo bekommt man den Key?).
+    const PROVIDER_UI = {
+      anthropic: { placeholder: 'sk-ant-…', console: 'https://console.anthropic.com/settings/keys', consoleLabel: 'Anthropic-Konsole öffnen',
+        steps: ['Bei <b>console.anthropic.com</b> anmelden.',
+                'Unter <b>Billing</b> etwas Guthaben aufladen (ab wenigen $ – eine Generierung kostet nur Cent-Beträge).',
+                '<b>API keys → Create Key</b>, den Schlüssel kopieren und hier einfügen.'] },
+      mistral: { placeholder: 'Mistral API-Key …', console: 'https://console.mistral.ai/api-keys', consoleLabel: 'Mistral-Konsole öffnen',
+        steps: ['Bei <b>console.mistral.ai</b> anmelden.',
+                'Unter <b>Billing/Plans</b> einen Zahlungsweg hinterlegen (Pay-as-you-go).',
+                '<b>API Keys → Create new key</b>, den Schlüssel kopieren und hier einfügen.'] },
+    };
+
+    provSel.innerHTML = Object.entries(PROVIDERS).map(([id, p]) => `<option value="${id}">${p.label}</option>`).join('');
+    const curProvider = () => provSel.value;
+    const keyKey = () => 'cpe.aiKey.' + curProvider();       // Key pro Anbieter gemerkt
+    const modelKey = () => 'cpe.aiModel.' + curProvider();
+
+    // Hilfe steckt hinter dem „?" und ist standardmäßig eingeklappt (spart Platz).
+    const renderHelp = () => {
+      const ui = PROVIDER_UI[curProvider()] || PROVIDER_UI.anthropic;
+      helpBox.innerHTML = '<ol>' + ui.steps.map((s) => `<li>${s}</li>`).join('') + '</ol>'
+        + `<a class="gen-console-btn" href="${ui.console}" target="_blank" rel="noopener">${ui.consoleLabel} ↗</a>`
+        + '<p class="gen-help-note">Der Key bleibt in deinem Browser (nur diese Sitzung) und geht an niemanden außer dem Anbieter.</p>';
+      keyEl.placeholder = ui.placeholder;
+    };
+    const helpBtn = $('genKeyHelpBtn');
+    if (helpBtn) helpBtn.onclick = () => { helpBox.hidden = !helpBox.hidden; helpBtn.classList.toggle('on', !helpBox.hidden); };
+    const fillModels = () => {
+      const p = PROVIDERS[curProvider()];
+      sel.innerHTML = p.models.map((m) => `<option value="${m.id}">${m.label}</option>`).join('');
+      const saved = sessionStorage.getItem(modelKey());
+      sel.value = (saved && p.models.some((m) => m.id === saved)) ? saved : p.defaultModel;
+    };
+    // Anbieterwechsel: Modelle, Hilfe und gemerkten Key des Anbieters laden.
+    const applyProvider = () => {
+      renderHelp(); fillModels();
+      keyEl.value = sessionStorage.getItem(keyKey()) || '';
+      helpBox.hidden = true;                              // eingeklappt lassen
+      if (helpBtn) helpBtn.classList.remove('on');
+      sessionStorage.setItem('cpe.aiProvider', curProvider());
+    };
+    provSel.onchange = applyProvider;
+
+    keyEl.addEventListener('change', () => { const v = keyEl.value.trim(); if (v) sessionStorage.setItem(keyKey(), v); });
 
     // Eingaben, die für „neu generieren" in der Sitzung gemerkt werden.
     const FIELDS = { genThema: 'cpe.aiThema', genZiel: 'cpe.aiZiel', genTon: 'cpe.aiTon', genStruktur: 'cpe.aiStruktur', genCount: 'cpe.aiCount' };
@@ -462,12 +611,12 @@ export class UI {
     themaEl.addEventListener('input', syncCount);
 
     btn.onclick = () => {
-      const savedKey = sessionStorage.getItem('cpe.aiKey') || '';
-      keyEl.value = savedKey;                             // in der Sitzung gemerkter Key
+      provSel.value = sessionStorage.getItem('cpe.aiProvider') || DEFAULT_PROVIDER;
+      applyProvider();                                    // Modelle + Hilfe + gemerkter Key des Anbieters
       Object.entries(FIELDS).forEach(([id, k]) => { $(id).value = sessionStorage.getItem(k) || ''; });
-      syncHelp(); syncCount(); errEl.hidden = true;
+      syncCount(); errEl.hidden = true;
       modal.classList.add('active');
-      setTimeout(() => (savedKey ? $('genThema') : keyEl).focus(), 0);
+      setTimeout(() => (keyEl.value ? $('genThema') : keyEl).focus(), 0);
     };
     $('genCancel').onclick = () => modal.classList.remove('active');
     // „Neu starten": Eingaben leeren (Key bleibt), für ein frisches Thema.
@@ -489,15 +638,15 @@ export class UI {
         errEl.hidden = false; themaEl.focus(); return;
       }
 
-      sessionStorage.setItem('cpe.aiKey', apiKey);       // nur Sitzung, weg beim Schließen
-      sessionStorage.setItem('cpe.aiModel', sel.value);
+      sessionStorage.setItem(keyKey(), apiKey);          // nur Sitzung, pro Anbieter
+      sessionStorage.setItem(modelKey(), sel.value);
       Object.entries(FIELDS).forEach(([id, k]) => sessionStorage.setItem(k, $(id).value));  // Eingaben merken
 
       const anzahl = parseInt($('genCount').value, 10);
       run.disabled = true; const label = run.textContent; run.textContent = 'Generiere …';
       try {
         const deck = await generateDeck({
-          apiKey, model: sel.value, thema,
+          provider: curProvider(), apiKey, model: sel.value, thema,
           zielgruppe: $('genZiel').value.trim(),
           tonalitaet: $('genTon').value.trim(),
           struktur: $('genStruktur').value.trim(),
@@ -522,6 +671,79 @@ export class UI {
     m.classList.add('active');
     setTimeout(() => document.getElementById('deckPaste').focus(), 0);
   }
+  // Deck als ZIP speichern: deck.json (Layout) + die verwendeten Bilder als echte
+  // Dateien (assets/…). Portabel, ohne Asset-Ordner, nichts auf GitHub. Alles im Browser.
+  async _exportDeckZip() {
+    if (typeof JSZip === 'undefined') { this._toast('ZIP-Bibliothek nicht geladen', 'error'); return; }
+    try {
+      await preloadDeckAssets(this.store.deck);           // alle referenzierten Bilder bereitstellen
+      const deck = JSON.parse(this.store.exportJSON());   // tiefe Kopie
+      const ids = new Set();
+      deck.slides.forEach((s) => {
+        if (s.background?.assetId) ids.add(s.background.assetId);
+        if (s.overlay?.assetId) ids.add(s.overlay.assetId);
+        (s.decor || []).forEach((d) => d.assetId && ids.add(d.assetId));
+      });
+      if (deck.brand?.show && deck.brand?.logoAssetId) ids.add(deck.brand.logoAssetId);
+
+      const zip = new JSZip();
+      const assetsDir = zip.folder('assets');
+      deck.assets = deck.assets || {};
+      for (const id of ids) {
+        const asset = getAsset(id); if (!asset) continue;
+        const img = getLoadedImage(id) || await loadAssetImage(id); if (!img) continue;
+        const cv = document.createElement('canvas');
+        cv.width = img.naturalWidth; cv.height = img.naturalHeight;
+        cv.getContext('2d').drawImage(img, 0, 0);
+        const jpg = asset.type === 'background';            // Hintergrund als JPEG (klein), Rest PNG (Transparenz)
+        const blob = await new Promise((res) => cv.toBlob(res, jpg ? 'image/jpeg' : 'image/png', jpg ? 0.9 : undefined));
+        const fileName = id.replace(/[^a-z0-9._-]+/gi, '-') + (jpg ? '.jpg' : '.png');
+        assetsDir.file(fileName, blob);                     // echte Bilddatei im ZIP
+        deck.assets[id] = {
+          type: asset.type,
+          file: 'assets/' + fileName,                       // Verweis auf die Datei (keine Data-URL)
+          w: img.naturalWidth, h: img.naturalHeight,
+          ...(asset.blend ? { blend: asset.blend } : {}),
+          ...(asset.defaultOpacity != null ? { defaultOpacity: asset.defaultOpacity } : {}),
+          ...(asset.transparent ? { transparent: true } : {}),
+        };
+      }
+      zip.file('deck.json', JSON.stringify(deck, null, 2));
+
+      const name = (deck.meta?.title || 'deck').replace(/[^a-z0-9]+/gi, '-').replace(/^-|-$/g, '').toLowerCase() || 'deck';
+      const out = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE', compressionOptions: { level: 6 } });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(out); a.download = name + '.deck.zip';
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+      this._toast(`Deck gespeichert (${Math.round(out.size / 1024).toLocaleString('de-DE')} KB, ZIP mit Bildern)`, 'success');
+    } catch (err) {
+      console.error(err);
+      this._toast('Speichern fehlgeschlagen: ' + (err.message || 'Fehler'), 'error');
+    }
+  }
+  // ZIP-Deck laden: deck.json + Bilddateien aus dem ZIP. Bilder werden in die
+  // Laufzeit übernommen (als Data-URL im Speicher, damit sie auch einen Reload überstehen).
+  async _loadDeckZip(file) {
+    if (typeof JSZip === 'undefined') throw new Error('ZIP-Bibliothek nicht geladen');
+    const zip = await JSZip.loadAsync(file);
+    const entry = zip.file('deck.json');
+    if (!entry) throw new Error('Keine deck.json im ZIP gefunden');
+    const deck = JSON.parse(await entry.async('string'));
+    for (const [, a] of Object.entries(deck.assets || {})) {
+      if (!a.file) continue;
+      const f = zip.file(a.file); if (!f) continue;
+      const b64 = await f.async('base64');
+      const mime = /\.jpe?g$/i.test(a.file) ? 'image/jpeg' : 'image/png';
+      a.src = `data:${mime};base64,${b64}`;               // Bild in die Laufzeit übernehmen
+      delete a.file;
+    }
+    this.store.loadDeck(deck);                             // registerDeckAssets registriert die Bilder
+    this._assignFolderBackgrounds();
+    await preloadDeckAssets(this.store.deck);
+    this.renderer.fit();
+    this.renderThumbs();
+  }
   // Toleriert Code-Fences / Fließtext um das JSON (externe KI-Ausgaben).
   _extractJSON(text) {
     let t = (text || '').trim();
@@ -541,10 +763,11 @@ export class UI {
   _pickDeckFile() { document.getElementById('deckFile')?.click(); }
   async _loadDeckFile(file) {
     try {
-      const text = await file.text();
-      await this._loadDeckJSON(text);
+      const isZip = /\.zip$/i.test(file.name) || /zip/.test(file.type || '');
+      if (isZip) await this._loadDeckZip(file);
+      else await this._loadDeckJSON(await file.text());
       this._toast(`„${file.name}" geladen`, 'success');
-    } catch (err) { console.error(err); this._toast('Ungültiges deck.json', 'error'); }
+    } catch (err) { console.error(err); this._toast('Konnte Datei nicht laden: ' + (err.message || ''), 'error'); }
   }
   // Sieht ein Text nach einem Deck aus? (grobe Prüfung vor dem Laden)
   _looksLikeDeck(text) {
@@ -554,15 +777,15 @@ export class UI {
   }
   _bindDeckDrop() {
     const app = document.querySelector('.app') || document.body;
-    const isJsonDrag = (e) => [...(e.dataTransfer?.items || [])]
-      .some((it) => it.kind === 'file' && (it.type === 'application/json' || it.type === ''));
+    const isDeckDrag = (e) => [...(e.dataTransfer?.items || [])]
+      .some((it) => it.kind === 'file' && (it.type === 'application/json' || /zip/.test(it.type) || it.type === ''));
     app.addEventListener('dragover', (e) => {
-      if (!isJsonDrag(e)) return;            // Asset-Drops auf die Bühne nicht stören
+      if (!isDeckDrag(e)) return;            // Asset-Drops auf die Bühne nicht stören
       e.preventDefault(); app.classList.add('deck-drop');
     });
     app.addEventListener('dragleave', (e) => { if (e.target === app) app.classList.remove('deck-drop'); });
     app.addEventListener('drop', async (e) => {
-      const f = [...(e.dataTransfer?.files || [])].find((x) => /\.json$/i.test(x.name) || x.type === 'application/json');
+      const f = [...(e.dataTransfer?.files || [])].find((x) => /\.(json|zip)$/i.test(x.name) || x.type === 'application/json' || /zip/.test(x.type || ''));
       if (!f) return;
       e.preventDefault(); app.classList.remove('deck-drop');
       await this._loadDeckFile(f);

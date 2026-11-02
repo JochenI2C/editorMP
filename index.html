@@ -11,6 +11,7 @@
   <!-- Libs als UMD-Globals (window.Konva / window.jspdf), lokal vendored, vor den Modulen -->
   <script src="./vendor/konva.min.js"></script>
   <script src="./vendor/jspdf.umd.min.js"></script>
+  <script src="./vendor/jszip.min.js"></script>
 </head>
 <body>
   <!-- erzwingt Font-Download vor Canvas-Textsatz -->
@@ -30,6 +31,10 @@
             <line x1="6" y1="2.5" x2="6" y2="13.5"/>
           </svg>
         </button>
+        <div class="menu-wrap">
+          <button id="projBtn" title="Projekte (lokal auf deinem Rechner gespeichert)">Projekte ▾</button>
+          <div class="menu menu-left" id="projMenu"></div>
+        </div>
         <select id="formatSelect" class="fmt-select" title="Format / Seitenverhältnis"></select>
       </div>
       <div class="group">
@@ -61,10 +66,10 @@
         <div class="menu-wrap">
           <button id="deckBtn">Deck ▾</button>
           <div class="menu" id="deckMenu">
-            <button data-deck="import">Deck importieren …</button>
+            <button data-deck="import">Deck importieren (ZIP oder JSON) …</button>
             <button data-deck="paste">Deck einfügen (Text) …</button>
           </div>
-          <input type="file" id="deckFile" accept=".json,application/json" hidden />
+          <input type="file" id="deckFile" accept=".zip,.json,application/zip,application/json" hidden />
         </div>
         <div class="menu-wrap">
           <button id="resetBtn">Zurücksetzen ▾</button>
@@ -82,6 +87,8 @@
             <button data-export="png-all">PNG · alle Folien</button>
             <button data-export="pdf">PDF</button>
             <button data-export="mp4">Video</button>
+            <div class="menu-sep"></div>
+            <button data-export="deck-zip">Deck-Datei (ZIP, mit Bildern) …</button>
           </div>
         </div>
       </div>
@@ -147,30 +154,22 @@
     <div class="modal-box">
       <div class="modal-title">Folien mit KI erzeugen</div>
       <div class="gen-grid">
-        <div class="gen-field gen-wide">
-          <span>Anthropic API-Key</span>
-          <input id="genKey" type="password" autocomplete="off" spellcheck="false" placeholder="sk-ant-…" />
-          <div class="gen-help" id="genKeyHelpBox">
-            <ol>
-              <li>Bei <b>console.anthropic.com</b> anmelden.</li>
-              <li>Unter <b>Billing</b> etwas Guthaben aufladen (geht ab wenigen $ – eine Deck-Generierung kostet nur Cent-Beträge).</li>
-              <li><b>API keys → Create Key</b>, den Schlüssel kopieren und hier einfügen.</li>
-            </ol>
-            <a class="gen-console-btn" href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener">Anthropic-Konsole öffnen ↗</a>
-            <p class="gen-help-note">Der Key bleibt in deinem Browser (nur diese Sitzung) und geht an niemanden außer Anthropic.</p>
-          </div>
-        </div>
+        <label class="gen-field">
+          <span>Anbieter</span>
+          <select id="genProvider"></select>
+        </label>
         <label class="gen-field">
           <span>Modell</span>
           <select id="genModel"></select>
         </label>
-        <label class="gen-field">
-          <span>Anzahl Folien</span>
-          <input id="genCount" type="number" min="1" max="12" placeholder="automatisch" />
-        </label>
+        <div class="gen-field gen-wide">
+          <span>API-Key <button type="button" id="genKeyHelpBtn" class="gen-help-q" title="Woher bekomme ich einen Key?" aria-label="Hilfe zum API-Key">?</button></span>
+          <input id="genKey" type="password" autocomplete="off" spellcheck="false" placeholder="sk-ant-…" />
+          <div class="gen-help" id="genKeyHelpBox" hidden></div>
+        </div>
         <label class="gen-field gen-wide">
           <span>Thema / Quelltext</span>
-          <textarea id="genThema" rows="6" spellcheck="false" placeholder="Thema in einem Satz …"></textarea>
+          <textarea id="genThema" rows="4" spellcheck="false" placeholder="Thema in einem Satz …"></textarea>
           <div class="gen-count" id="themaCount"></div>
         </label>
         <label class="gen-field">
@@ -181,9 +180,13 @@
           <span>Tonalität</span>
           <input id="genTon" type="text" placeholder="z. B. warm, ermutigend" />
         </label>
-        <label class="gen-field gen-wide">
-          <span>Struktur / Aufbau <span class="gen-opt">(optional)</span></span>
-          <textarea id="genStruktur" rows="2" spellcheck="false" placeholder="z. B. Einstieg, 3 Tipps, Abschluss mit Call-to-Action"></textarea>
+        <label class="gen-field">
+          <span>Anzahl Folien</span>
+          <input id="genCount" type="number" min="1" max="12" placeholder="automatisch" />
+        </label>
+        <label class="gen-field">
+          <span>Struktur <span class="gen-opt">(optional)</span></span>
+          <input id="genStruktur" type="text" placeholder="z. B. Einstieg, 3 Tipps, CTA" />
         </label>
       </div>
       <div id="genError" class="gen-error" hidden></div>
